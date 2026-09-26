@@ -10,7 +10,11 @@ agglomerative clustering:
   hold two peaks of the same input spectrum, and when its endpoint span
   (highest minus lowest member m/z) does not exceed
   ``max(tolerance_da, endpoint_mean * tolerance_ppm / 1e6)``, the endpoint
-  mean being the average of the merged cluster's lowest and highest m/z;
+  mean being the average of the merged cluster's lowest and highest m/z.
+  The boundary is evaluated in an overflow-stable form — the endpoint
+  mean as two halved endpoints and the ppm comparison as a span/mean
+  ratio — so summing two legal m/z values near the float maximum cannot
+  turn the ppm allowance infinite and merge out-of-tolerance peaks;
 * every round merges the best legal pair, compared lexicographically by
   (merged span, merged lowest m/z, sorted member (spectrum, peak)
   indices), and repeats until no legal merge remains.
@@ -132,6 +136,34 @@ def _weighted_mean(values: list[float], weights: list[float]) -> float:
     return sum(values) / len(values)
 
 
+def _span_within_limit(
+    span: float,
+    merged_lo: float,
+    merged_hi: float,
+    tolerance_da: float,
+    tolerance_ppm: float,
+) -> bool:
+    """Overflow-stable form of ``span <= max(tolerance_da, mean * ppm / 1e6)``.
+
+    ``mean`` is the endpoint mean ``(merged_lo + merged_hi) / 2`` of the
+    merged cluster. Summing the endpoints directly overflows to ``inf``
+    for legal m/z pairs near the float maximum (e.g. 1e308 and 1.12e308
+    add up to 2.12e308), which turns the ppm allowance into an infinite
+    limit and merges arbitrarily distant peaks; halving each endpoint
+    before adding cannot overflow. The ppm comparison is likewise written
+    as the ratio ``span / mean <= ppm / 1e6`` — both sides stay finite for
+    a positive mean — instead of forming the potentially huge product
+    ``mean * ppm``. A non-positive endpoint mean makes the ppm allowance
+    non-positive, so the Da tolerance is then the only limit.
+    """
+    if span <= tolerance_da:
+        return True
+    mean = merged_lo / 2.0 + merged_hi / 2.0
+    if mean <= 0.0:
+        return False
+    return span / mean <= tolerance_ppm / 1e6
+
+
 def _validate_spectra(spectra: list[list[tuple[float, float]]]) -> None:
     """Require strictly increasing m/z per spectrum and a positive base peak."""
     for s_idx, peaks in enumerate(spectra):
@@ -215,9 +247,20 @@ def build_consensus_spectrum(
 
     # Any legal pair's span is bounded by ``window``: a legal span is at
     # most max(tolerance_da, endpoint_mean * ppm/1e6) and the endpoint mean
-    # never exceeds the global maximum m/z.
+    # never exceeds the global maximum m/z. Multiply by the ppm ratio first
+    # so a huge but legal combination (e.g. m/z 1e308 at 110000 ppm) does
+    # not overflow the intermediate product into an infinite window; should
+    # the bound still overflow, every pair's span also fits inside the full
+    # m/z span of the input, so cap the window there. The cap can only drop
+    # unreachable candidates, keeping the window consistent with the merge
+    # test: no legal pair is skipped and no out-of-tolerance pair is
+    # admitted (``evaluate`` is the authoritative span check).
     max_mz = singletons[-1][0] if singletons else 0.0
-    window = max(tolerance_da, max_mz * tolerance_ppm / 1e6)
+    min_mz = singletons[0][0] if singletons else 0.0
+    window = max(tolerance_da, max_mz * (tolerance_ppm / 1e6))
+    full_span = max_mz - min_mz
+    if window > full_span:
+        window = full_span
 
     def evaluate(a: int, b: int):
         """Heap key for merging clusters ``a``/``b``, or None when illegal."""
@@ -226,11 +269,9 @@ def build_consensus_spectrum(
         merged_lo = lo[a] if lo[a] < lo[b] else lo[b]
         merged_hi = hi[a] if hi[a] > hi[b] else hi[b]
         span = merged_hi - merged_lo
-        limit = tolerance_da
-        ppm_limit = (merged_lo + merged_hi) / 2.0 * tolerance_ppm / 1e6
-        if ppm_limit > limit:
-            limit = ppm_limit
-        if span > limit:
+        if not _span_within_limit(
+            span, merged_lo, merged_hi, tolerance_da, tolerance_ppm
+        ):
             return None
         merged_members = tuple(sorted(members[a] + members[b]))
         first, second = (a, b) if a < b else (b, a)

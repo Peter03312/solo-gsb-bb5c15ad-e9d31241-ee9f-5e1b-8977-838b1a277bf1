@@ -10,7 +10,12 @@ agglomerative clustering:
   hold two peaks of the same input spectrum, and when its endpoint span
   (highest minus lowest member m/z) does not exceed
   ``max(tolerance_da, endpoint_mean * tolerance_ppm / 1e6)``, the endpoint
-  mean being the average of the merged cluster's lowest and highest m/z;
+  mean being the average of the merged cluster's lowest and highest m/z.
+  The bound is evaluated in an overflow-stable form (see
+  ``_span_limit``) so legal finite m/z values near the float maximum,
+  whose endpoint sum would overflow, never widen the tolerance to
+  infinity; the candidate scan window uses the identical evaluation and
+  therefore matches every merge decision exactly;
 * every round merges the best legal pair, compared lexicographically by
   (merged span, merged lowest m/z, sorted member (spectrum, peak)
   indices), and repeats until no legal merge remains.
@@ -132,6 +137,42 @@ def _weighted_mean(values: list[float], weights: list[float]) -> float:
     return sum(values) / len(values)
 
 
+def _span_limit(lo: float, hi: float, tolerance_da: float, tolerance_ppm: float) -> float:
+    """Complete-linkage span bound for endpoints ``lo``/``hi``.
+
+    Returns ``max(tolerance_da, endpoint_mean * tolerance_ppm / 1e6)`` with
+    the ppm factor folded in *before* the m/z multiplication. Forming
+    ``(lo + hi) / 2`` first overflows for legal finite peaks near the float
+    maximum (e.g. 1e308 and 1.12e308 sum to infinity), which used to turn
+    the ppm bound itself into infinity and admit over-tolerance merges. The
+    endpoint mean is therefore computed with an overflow-stable midpoint,
+    so the result is finite whenever the mathematical value is.
+    """
+    if (lo < 0.0) != (hi < 0.0):
+        # Opposite signs: lo + hi itself could overflow, while lo/2 + hi/2
+        # cannot (both summands are halved finite numbers).
+        endpoint_mean = lo / 2.0 + hi / 2.0
+    else:
+        endpoint_mean = lo + (hi - lo) / 2.0
+    ppm_limit = endpoint_mean * (tolerance_ppm / 1e6)
+    return tolerance_da if tolerance_da > ppm_limit else ppm_limit
+
+
+def _within_span_limit(
+    lo: float, hi: float, tolerance_da: float, tolerance_ppm: float
+) -> bool:
+    """Whether ``hi - lo`` obeys the complete-linkage span bound.
+
+    A direct subtraction also overflows for opposite-sign m/z extremes, so
+    that case is tested as the equivalent addition ``lo + limit >= hi``,
+    where the limit is at least ``tolerance_da`` (hence non-negative).
+    """
+    limit = _span_limit(lo, hi, tolerance_da, tolerance_ppm)
+    if (lo < 0.0) != (hi < 0.0):
+        return lo + limit >= hi
+    return hi - lo <= limit
+
+
 def _validate_spectra(spectra: list[list[tuple[float, float]]]) -> None:
     """Require strictly increasing m/z per spectrum and a positive base peak."""
     for s_idx, peaks in enumerate(spectra):
@@ -215,9 +256,12 @@ def build_consensus_spectrum(
 
     # Any legal pair's span is bounded by ``window``: a legal span is at
     # most max(tolerance_da, endpoint_mean * ppm/1e6) and the endpoint mean
-    # never exceeds the global maximum m/z.
+    # never exceeds the global maximum m/z. Degenerate endpoints
+    # (max_mz, max_mz) give that bound exactly; use the same overflow-stable
+    # evaluation as the merge test, or giant finite m/z values would push
+    # the window to infinity and make the candidate scan quadratic.
     max_mz = singletons[-1][0] if singletons else 0.0
-    window = max(tolerance_da, max_mz * tolerance_ppm / 1e6)
+    window = _span_limit(max_mz, max_mz, tolerance_da, tolerance_ppm)
 
     def evaluate(a: int, b: int):
         """Heap key for merging clusters ``a``/``b``, or None when illegal."""
@@ -226,11 +270,9 @@ def build_consensus_spectrum(
         merged_lo = lo[a] if lo[a] < lo[b] else lo[b]
         merged_hi = hi[a] if hi[a] > hi[b] else hi[b]
         span = merged_hi - merged_lo
-        limit = tolerance_da
-        ppm_limit = (merged_lo + merged_hi) / 2.0 * tolerance_ppm / 1e6
-        if ppm_limit > limit:
-            limit = ppm_limit
-        if span > limit:
+        if not math.isfinite(span) or not _within_span_limit(
+            merged_lo, merged_hi, tolerance_da, tolerance_ppm
+        ):
             return None
         merged_members = tuple(sorted(members[a] + members[b]))
         first, second = (a, b) if a < b else (b, a)

@@ -217,6 +217,85 @@ def test_weights_spanning_orders_of_magnitude():
     assert math.isfinite(cluster.intensity)
 
 
+def test_huge_mz_outside_ppm_tolerance_does_not_merge():
+    # Regression: (1e308 + 1.12e308) overflows to infinity when the ppm
+    # limit forms the endpoint mean by summing the endpoints first, which
+    # made the tolerance itself infinite and merged peaks 113208 ppm apart
+    # under tolerance_ppm=110000. The stable endpoint-mean evaluation must
+    # keep them apart.
+    spectra = [[(1e308, 100.0)], [(1.12e308, 100.0)]]
+    result = build_consensus_spectrum(spectra, 0.005, 110000.0, 2)
+    assert result.clusters == ()
+
+
+def test_huge_mz_within_ppm_tolerance_still_merges():
+    # The fix must not over-correct: 1e308 and 1.11e308 are ~104265 ppm
+    # apart, a legal merge under tolerance_ppm=110000 at the float ceiling.
+    spectra = [[(1e308, 100.0)], [(1.11e308, 100.0)]]
+    result = build_consensus_spectrum(spectra, 0.005, 110000.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert math.isfinite(cluster.mz)
+    assert cluster.mz == pytest.approx(1.055e308, rel=1e-12)
+    assert _members(cluster) == [(0, 0), (1, 0)]
+
+
+def test_huge_mz_ppm_boundary_is_exact():
+    # The complete-linkage bound is inclusive at the exact mathematical
+    # boundary max(tolerance_da, endpoint_mean * ppm/1e6), evaluated stably:
+    # the pair merges when tolerance_ppm equals the pair's exact relative
+    # span in ppm, and one ULP less of tolerance already rejects it.
+    mz_lo, mz_hi = 1e308, 1.12e308
+    boundary_ppm = (mz_hi - mz_lo) / (mz_lo + (mz_hi - mz_lo) / 2.0) * 1e6
+    assert len(
+        build_consensus_spectrum(
+            [[(mz_lo, 1.0)], [(mz_hi, 1.0)]], 0.005, boundary_ppm, 2
+        ).clusters
+    ) == 1
+    below = math.nextafter(boundary_ppm, 0.0)
+    assert build_consensus_spectrum(
+        [[(mz_lo, 1.0)], [(mz_hi, 1.0)]], 0.005, below, 2
+    ).clusters == ()
+
+
+def test_huge_mz_candidate_window_matches_merge_decision():
+    # The candidate scan window is computed with the same stable boundary as
+    # the merge test: it must neither skip legal far-apart merges nor admit
+    # over-tolerance ones (an overflowed infinite window used to scan every
+    # pair, with the overflowed limit then accepting all of them). Under
+    # 100000 ppm only the 1e308..1.10e308 pair (~95238 ppm) is legal: the
+    # 1.22e308 and 1.5e308 peaks are over the bound with every neighbour.
+    spectra = [
+        [(1e308, 100.0), (1.22e308, 50.0)],
+        [(1.10e308, 100.0)],
+        [(1.5e308, 100.0)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.005, 100000.0, 2)
+    assert len(result.clusters) == 1
+    assert _members(result.clusters[0]) == [(0, 0), (1, 0)]
+    # Deterministic across runs even at this scale.
+    again = build_consensus_spectrum(spectra, 0.005, 100000.0, 2)
+    assert again == result
+
+
+def test_huge_mz_same_spectrum_peaks_stay_mutually_exclusive():
+    # Mutual exclusion still holds at extreme m/z: with tolerance_ppm
+    # =100000 every pair of these peaks individually fits the span bound
+    # (~24691 ppm between adjacent peaks, ~48780 ppm across both spectrum-0
+    # peaks), yet the two spectrum-0 peaks can never share a cluster, so the
+    # spectrum-1 peak merges with the closer (1e308) one only.
+    spectra = [
+        [(1e308, 100.0), (1.05e308, 100.0)],
+        [(1.025e308, 100.0)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.005, 100000.0, 2)
+    for cluster in result.clusters:
+        spectra_in = {s for s, _ in _members(cluster)}
+        assert len(spectra_in) == len(cluster.members)
+    assert len(result.clusters) == 1
+    assert _members(result.clusters[0]) == [(0, 0), (1, 0)]
+
+
 def test_identical_mz_across_spectra_merge():
     spectra = [[(100.0, 100.0)], [(100.0, 50.0)], [(100.0, 25.0)]]
     result = build_consensus_spectrum(spectra, 0.001, 0.0, 2)
@@ -457,3 +536,50 @@ def test_endpoint_huge_intensities_serialise_finite(client):
         {"spectrum_index": 0, "peak_index": 0},
         {"spectrum_index": 1, "peak_index": 0},
     ]
+
+
+def test_endpoint_huge_mz_outside_ppm_tolerance_does_not_merge(client):
+    # Regression for the overflowed endpoint-sum tolerance: 1e308 and
+    # 1.12e308 are ~113208 ppm apart and must stay separate under
+    # tolerance_ppm=110000 even though (lo + hi) overflows to infinity.
+    big = 1e308
+    resp = client.post(
+        "/api/v1/consensus-spectrum",
+        json=_payload(
+            [[(big, 100.0)], [(1.12 * big, 100.0)]],
+            tolerance_da=0.005,
+            tolerance_ppm=110000.0,
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cluster_count"] == 0
+    assert body["clusters"] == []
+    assert "Infinity" not in resp.text and "NaN" not in resp.text
+
+
+def test_endpoint_huge_mz_within_ppm_tolerance_merges(client):
+    # The boundary fix must not reject legal giant inputs: ~104265 ppm apart
+    # under 110000 ppm merges, and the finite giant consensus m/z must still
+    # serialise as strict JSON.
+    big = 1e308
+    resp = client.post(
+        "/api/v1/consensus-spectrum",
+        json=_payload(
+            [[(big, 100.0)], [(1.11 * big, 100.0)]],
+            tolerance_da=0.005,
+            tolerance_ppm=110000.0,
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cluster_count"] == 1
+    cluster = body["clusters"][0]
+    assert math.isfinite(cluster["mz"])
+    assert cluster["mz"] == pytest.approx(1.055e308, rel=1e-6)
+    assert cluster["members"] == [
+        {"spectrum_index": 0, "peak_index": 0},
+        {"spectrum_index": 1, "peak_index": 0},
+    ]
+    assert "Infinity" not in resp.text and "NaN" not in resp.text
+    json.loads(resp.text)
